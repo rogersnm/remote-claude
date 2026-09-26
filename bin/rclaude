@@ -221,7 +221,7 @@ link_sock=
 # Background processes and the scratch directory, stopped and removed on exit.
 cleanup_pids=()
 cleanup_dir=
-# shellcheck disable=SC2329 # run by the trap
+# shellcheck disable=SC2317,SC2329 # run by the trap
 cleanup() {
   [[ ${#cleanup_pids[@]} -eq 0 ]] || kill "${cleanup_pids[@]}" 2>/dev/null
   [[ -z $cleanup_dir ]] || rm -rf "$cleanup_dir"
