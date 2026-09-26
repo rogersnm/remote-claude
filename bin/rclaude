@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# rclaude: start Claude Code with its file and shell tools on another machine.
+#
+#   rclaude <host> [--cwd <dir>] [--root <dir>]... [--server <path>] [--name <name>] [claude args...]
+#
+# <host> is anything `ssh` accepts (an alias from ~/.ssh/config, user@host, an IP).
+# Every argument rclaude does not recognise is passed to `claude`.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: rclaude <host> [options] [claude args...]
+
+  --cwd <dir>      the remote shell's starting directory, and the session's working tree;
+                   a relative path is relative to the remote home directory (write
+                   `src/app`, not `~/src/app`, which your local shell expands)
+  --root <dir>     a remote directory the file tools may touch (repeatable; default: --cwd,
+                   or the remote home directory)
+  --server <path>  the remote-claude binary on the host (default: $HOME/.cargo/bin/remote-claude,
+                   where `cargo install` puts it; $HOME expands on the host)
+  --name <name>    the MCP server name, which prefixes the tool names (default: from <host>)
+
+Anything else is passed to claude, e.g. `rclaude devbox --cwd src/app --resume`.
+EOF
+  exit 2
+}
+
+[[ $# -gt 0 && $1 != -* ]] || usage
+host=$1
+shift
+
+cwd=
+roots=()
+# shellcheck disable=SC2016 # $HOME is for the remote shell to expand
+server='$HOME/.cargo/bin/remote-claude'
+name=
+claude_args=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --cwd | --root | --server | --name)
+      [[ $# -ge 2 ]] || usage
+      case $1 in
+        --cwd) cwd=$2 ;;
+        --root) roots+=("$2") ;;
+        --server) server=$2 ;;
+        --name) name=$2 ;;
+      esac
+      shift 2
+      ;;
+    -h | --help) usage ;;
+    *)
+      claude_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# The MCP server name is part of every tool name (mcp__<name>__read), which allows only these characters.
+name=${name:-$host}
+name=${name//[^A-Za-z0-9_-]/_}
+
+# Single-quoted for the remote shell, which splits the command ssh hands it. A leading ~/ is left
+# outside the quotes so the remote shell expands it; the server path is left bare so $HOME does too.
+remote_quote() {
+  local s=$1 prefix='' escaped="'\\''"
+  # shellcheck disable=SC2088 # the tilde is for the remote shell to expand
+  if [[ $s == "~/"* ]]; then
+    # shellcheck disable=SC2088
+    prefix='~/'
+    s=${s#\~/}
+  fi
+  printf "%s'%s'" "$prefix" "${s//\'/$escaped}"
+}
+
+json_string() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
+remote="$server serve"
+for root in ${roots[@]+"${roots[@]}"}; do
+  remote+=" --root $(remote_quote "$root")"
+done
+if [[ -n $cwd ]]; then
+  [[ ${#roots[@]} -gt 0 ]] || remote+=" --root $(remote_quote "$cwd")"
+  remote+=" --cwd $(remote_quote "$cwd")"
+fi
+
+# One held connection per host: every server launch is a channel on it, so a tool call is one
+# round trip. BatchMode because nothing can answer a prompt: the session's stdin and stdout are
+# the MCP stream.
+ssh_args=(-T
+  -o BatchMode=yes
+  -o ControlMaster=auto
+  -o "ControlPath=$HOME/.ssh/rclaude-%C"
+  -o ControlPersist=10m
+  -o ServerAliveInterval=30
+  "$host" "$remote")
+ssh_json=
+for a in "${ssh_args[@]}"; do
+  ssh_json+=${ssh_json:+, }$(json_string "$a")
+done
+mcp_config="{\"mcpServers\": {$(json_string "$name"): {\"type\": \"stdio\", \"command\": \"ssh\", \"args\": [$ssh_json]}}}"
+
+# A bare-name deny takes a tool out of Claude's context entirely, so Claude sees only the remote
+# set. The list names every local file and shell tool a Claude Code build may carry; a name a
+# build lacks draws a warning and is otherwise ignored. Leaving Grep out once had Claude read a
+# local README with it and report it as the remote one.
+settings="{\"permissions\": {
+  \"deny\": [\"Read\", \"Edit\", \"Write\", \"MultiEdit\", \"NotebookEdit\", \"NotebookRead\", \"Grep\", \"Glob\", \"LS\", \"Bash\", \"EnterWorktree\", \"ExitWorktree\"],
+  \"allow\": [\"mcp__${name}__read\", \"mcp__${name}__edit\", \"mcp__${name}__write\", \"mcp__${name}__bash\", \"mcp__${name}__bash_jobs\"]
+}}"
+
+# Claude Code's environment block (platform, working directory, shell) describes this machine and
+# outranks an MCP server's instructions; without this, asked where it is working, Claude names
+# the local machine.
+where=${cwd:-the remote home directory}
+prompt="You are working on the remote machine \`$host\`, not on the machine Claude Code runs on. \
+Your only file and shell tools are mcp__${name}__*; there are no local ones. \
+Your working directory is $where on \`$host\`; answer questions about where you are or what you \
+are working on from there, not from the local environment above."
+
+# Claude Code keys session history and project memory by the directory it starts in. An empty
+# directory per host and remote working tree gives each its own, and leaves no local checkout to
+# mistake for the remote one.
+tree=${cwd:-home}
+tree=${tree//[^A-Za-z0-9_.-]/_}
+state=${XDG_STATE_HOME:-$HOME/.local/state}/rclaude/$name/$tree
+mkdir -p "$state"
+cd "$state"
+
+exec claude --strict-mcp-config --settings "$settings" --append-system-prompt "$prompt" \
+  ${claude_args[@]+"${claude_args[@]}"} --mcp-config "$mcp_config"
