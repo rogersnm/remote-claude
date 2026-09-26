@@ -92,13 +92,13 @@ Each host and working tree gets its own empty local start directory under `~/.lo
 ```json
 {
   "permissions": {
-    "deny": ["Read", "Edit", "Write", "NotebookEdit", "Grep", "Glob", "Bash", "EnterWorktree", "ExitWorktree"],
+    "deny": ["Read", "Edit", "Write", "NotebookEdit", "Grep", "Glob", "Bash", "Monitor", "DesignSync", "EnterWorktree", "ExitWorktree"],
     "allow": ["mcp__myhost__read", "mcp__myhost__edit", "mcp__myhost__write", "mcp__myhost__bash", "mcp__myhost__bash_jobs"]
   }
 }
 ```
 
-The deny list names every local file and shell tool, and all of them matter: with `Grep` still allowed, Claude once read a local README with it and reported it as the remote one. Worktree isolation is local and is denied too; make worktrees by hand with `git worktree` through `bash`.
+The deny list names every tool that reads local files or runs local commands, and all of them matter: with `Grep` still allowed, Claude once read a local README with it and reported it as the remote one. `Monitor` runs its command in a local shell, and `DesignSync` can upload local files. Worktree isolation is local and is denied too; make worktrees by hand with `git worktree` through `bash`.
 
 **An appended system prompt**, saying the session is working on the remote machine and has no local tools. Claude Code's own environment section (platform, working directory, shell) describes the local machine and ranks above an MCP server's instructions. Without the extra prompt, asked where it is working, Claude names your laptop.
 
