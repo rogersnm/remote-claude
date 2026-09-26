@@ -2,6 +2,21 @@
 
 Run Claude Code on your laptop while its files and shell live on another machine.
 
+```
+Your laptop                                      The remote machine
+─────────────────────────────                    ─────────────────────────
+claude  (the CLI, model calls,                   remote-claude serve
+         plan mode, skills, memory)              (a small Rust program)
+   │                                                ▲
+   │  Claude decides: "run `git status`"            │
+   │  → calls tool mcp__myhost__bash                │
+   │                                                │
+   └── ssh myhost remote-claude serve ──────────────┘
+        (stdin/stdout carry JSON: "run this command" → "here's the output")
+```
+
+The remote machine does no thinking: it reads, edits and runs commands, and sends back the results. Claude's model calls, your login, skills and memory stay on the laptop. Only tool calls cross the network; the session itself lives on the laptop.
+
 Claude Code keeps running locally, with its plan mode, subagents, skills, memory, and login. Its `Read`, `Edit`, `Write` and `Bash` tools are switched off, and a small MCP server on the remote machine provides `read`, `edit`, `write` and `bash` in their place, with the same parameters and the same output. Claude Code starts that server over ssh, so the ssh session's stdin and stdout carry the MCP stream. The server is one static binary and knows nothing about ssh.
 
 This is useful when the code, the build, or the hardware lives somewhere else: a big cloud box, a Linux machine for a Linux-only toolchain, or a home server you reach from a laptop on a bad connection. Nothing is synced or mounted. Each tool call is one round trip.
