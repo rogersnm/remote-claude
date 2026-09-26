@@ -84,6 +84,8 @@ rclaude --on-host                                 tmux ─ claude
 
 On Linux, Claude Code pastes an image by running `xclip -selection clipboard -t TARGETS -o` and `xclip -selection clipboard -t image/png -o`. `--on-host` links `xclip` to `remote-claude` in a directory it puts first on the session's `PATH`; run under that name, it answers those two calls through a port forwarded back to a small responder on your Mac, which reads the clipboard with `osascript` as Claude Code does locally. Any other `xclip` call, and every call while no `rclaude` connection is open, goes to the real `xclip` if there is one. A token written to `~/.rclaude-link` (mode 600) on every connect keeps the remote's other users off the link, and lets a Claude Code started in an earlier connection find the new one after you reattach.
 
+**mosh.** When both ends have [mosh](https://mosh.org) (`brew install mosh`, `apt install mosh`), `--on-host` connects with it instead of ssh: mosh echoes your keystrokes locally instead of waiting a round trip for each one, and a session survives the laptop sleeping or changing networks without reattaching. mosh carries only the terminal, so the link rides a separate ssh that reconnects by itself after a sleep. `mosh-server` is started with `LC_ALL=C.UTF-8`, the one UTF-8 locale every Linux has. `--ssh` connects with ssh anyway.
+
 `--command <cmd>` runs a shell command in a new tmux session instead of `claude`; a Claude Code that command starts still gets the link.
 
 On the remote this needs tmux, Claude Code and `remote-claude`. The link needs macOS; from Linux, `--on-host` still gives you the tmux session, without it. A tmux session started some other way does not have the links on its `PATH`, so start it with `rclaude`.

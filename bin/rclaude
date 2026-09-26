@@ -10,6 +10,11 @@
 # Every argument rclaude does not recognise is passed to `claude`.
 set -euo pipefail
 
+# The whole script is one block, read in full before any of it runs: bash otherwise reads a script
+# as it goes, and replacing this file under a running session would have it run the new file from
+# the old one's offset.
+{
+
 usage() {
   cat >&2 <<'EOF'
 usage: rclaude <host> [options] [claude args...]
@@ -26,6 +31,7 @@ usage: rclaude <host> [options] [claude args...]
                    disconnecting, with ctrl+v image paste from this machine's clipboard
   --session <name> the tmux session for --on-host; an existing one is reattached
                    (default: the last part of --cwd, or claude)
+  --ssh            for --on-host, connect with ssh even when mosh is installed on both ends
   --command <cmd>  for --on-host, a shell command for a new tmux session to run instead of
                    claude; a claude it starts still pastes from this machine's clipboard
 
@@ -109,6 +115,7 @@ roots=()
 server='$HOME/.cargo/bin/remote-claude'
 name=
 on_host=
+no_mosh=
 session=
 command=
 claude_args=()
@@ -128,6 +135,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --on-host)
       on_host=1
+      shift
+      ;;
+    --ssh)
+      no_mosh=1
       shift
       ;;
     -h | --help) usage ;;
@@ -207,6 +218,20 @@ sub open_file {
 link_port=
 link_token=
 link_sock=
+# Background processes and the scratch directory, stopped and removed on exit.
+cleanup_pids=()
+cleanup_dir=
+# shellcheck disable=SC2329 # run by the trap
+cleanup() {
+  [[ ${#cleanup_pids[@]} -eq 0 ]] || kill "${cleanup_pids[@]}" 2>/dev/null
+  [[ -z $cleanup_dir ]] || rm -rf "$cleanup_dir"
+}
+trap cleanup EXIT
+# A closed terminal is a hangup, which would end this without the EXIT trap.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 start_link() {
   local dir downloads
   [[ $(uname) == Darwin ]] && command -v perl >/dev/null || return 0
@@ -215,11 +240,11 @@ start_link() {
   link_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   link_port=$((20000 + RANDOM % 40000))
   link_sock=$dir/link.sock
+  cleanup_dir=$dir
   perl -e "$link_responder" "$link_sock" "$link_token" "$dir/clip.png" "$downloads" 2>/dev/null &
+  cleanup_pids+=($!)
   # Disowned, so killing it at exit prints no job notice.
   disown
-  # shellcheck disable=SC2064 # expanded now, deliberately
-  trap "kill $! 2>/dev/null; rm -rf $(shell_quote "$dir")" EXIT
   for _ in $(seq 50); do
     [[ -S $link_sock ]] && break
     sleep 0.1
@@ -230,19 +255,30 @@ start_link() {
 # records this connection's port and token. Rewritten on every connect, which is how a Claude Code
 # started in an earlier connection finds the new one after a reattach.
 link_setup() {
-  # shellcheck disable=SC2016 # for the host's shell to expand
-  local setup='mkdir -p ~/.local/share/rclaude/bin && for n in xclip open xdg-open; do ln -sfn '"$server"' ~/.local/share/rclaude/bin/$n; done'
-  [[ -z $link_port ]] || setup+=" && (umask 077 && printf '%s %s\n' $link_port $link_token > ~/.rclaude-link)"
+  local setup
+  setup=$(link_install)
+  [[ -z $link_port ]] || setup+=" && $(link_record)"
   printf '%s' "$setup"
+}
+link_install() {
+  # shellcheck disable=SC2016 # for the host's shell to expand
+  printf '%s' 'mkdir -p ~/.local/share/rclaude/bin && for n in xclip open xdg-open; do ln -sfn '"$server"' ~/.local/share/rclaude/bin/$n; done'
+}
+link_record() {
+  printf '%s' "(umask 077 && printf '%s %s\\n' $link_port $link_token > ~/.rclaude-link)"
 }
 
 # The PATH the host's programs run with, so they find those links first.
 # shellcheck disable=SC2016 # for the host's shell to expand
 link_path='PATH="$HOME/.local/share/rclaude/bin:$PATH"; export PATH'
 
-# Claude Code on the host, in tmux, over an ssh connection that carries the link.
+# Claude Code on the host, in tmux. Over mosh when both ends have it: mosh echoes keystrokes
+# locally and survives sleep and network changes, which ssh does neither of. mosh carries only the
+# terminal, so the link then rides its own ssh, reconnected in a loop for as long as this runs:
+# after a sleep mosh resumes by itself, and the loop brings the link back. Otherwise one ssh
+# connection carries both.
 run_on_host() {
-  local inner script remote a status
+  local inner script remote a status mosh_ready=
   start_link
   [[ -n $link_port ]] || echo "rclaude: pasting and opening on this machine need macOS; continuing without them" >&2
   inner="$link_path; "
@@ -254,14 +290,48 @@ run_on_host() {
       inner+=" $(shell_quote "$a")"
     done
   fi
-  script="$(link_setup) && exec tmux new-session -A -s $(shell_quote "$session")"
+  script="exec tmux new-session -A -s $(shell_quote "$session")"
   [[ -z $cwd ]] || script+=" -c $(remote_quote "$cwd")"
   script+=" $(shell_quote "$inner")"
-  # A login shell, so PATH has whatever the user's profile adds, such as where claude is installed.
-  # shellcheck disable=SC2016 # for the host's shell to expand
-  remote='exec "${SHELL:-/bin/sh}" -lc '"$(shell_quote "$script")"
 
-  local ssh=(ssh -t -o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=30)
+  local ssh=(ssh -o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=30)
+  if [[ -z $no_mosh ]] && command -v mosh >/dev/null &&
+    "${ssh[@]}" -T "$host" "$(link_install) && command -v mosh-server >/dev/null" </dev/null; then
+    mosh_ready=1
+  fi
+
+  if [[ -n $mosh_ready ]]; then
+    if [[ -n $link_port ]]; then
+      # The loop passes its stop on to the ssh it is waiting for, which would otherwise outlive it.
+      (
+        child=
+        trap '[[ -z $child ]] || kill "$child" 2>/dev/null; exit 0' TERM
+        while :; do
+          # -tt: a terminal on the host, so the sleep is hung up when this connection ends.
+          "${ssh[@]}" -tt -o ExitOnForwardFailure=yes -R "127.0.0.1:$link_port:$link_sock" "$host" \
+            "$(link_record) && exec sleep 2147483647" </dev/null >/dev/null 2>&1 &
+          child=$!
+          wait "$child"
+          sleep 5
+        done
+      ) &
+      cleanup_pids+=($!)
+      disown
+    fi
+    # A login shell, so PATH has whatever the user's profile adds, such as where claude is
+    # installed. mosh-server needs a UTF-8 locale the host has, and C.UTF-8 is the one every
+    # Linux has; it would otherwise take this machine's, which the host may lack.
+    # shellcheck disable=SC2016 # for the host's shell to expand
+    remote='exec "${SHELL:-/bin/sh}" -lc '"$(shell_quote "$link_path; $script")"
+    status=0
+    mosh --server='LC_ALL=C.UTF-8 mosh-server' --ssh='ssh -o ControlMaster=no -o ControlPath=none' \
+      "$host" -- sh -c "$remote" || status=$?
+    return $status
+  fi
+
+  # shellcheck disable=SC2016 # for the host's shell to expand
+  remote='exec "${SHELL:-/bin/sh}" -lc '"$(shell_quote "$(link_setup) && $script")"
+  ssh+=(-t)
   [[ -z $link_port ]] || ssh+=(-o ExitOnForwardFailure=yes -R "127.0.0.1:$link_port:$link_sock")
   status=0
   "${ssh[@]}" "$host" "$remote" || status=$?
@@ -346,3 +416,4 @@ status=0
 claude --strict-mcp-config --settings "$settings" --append-system-prompt "$prompt" \
   ${claude_args[@]+"${claude_args[@]}"} --mcp-config "$mcp_config" || status=$?
 exit $status
+}
