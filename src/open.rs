@@ -4,7 +4,7 @@
 //! `rclaude` connection is open, except that `xdg-open` then goes to the real one.
 
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::Path;
 use std::time::Duration;
 
@@ -51,7 +51,8 @@ fn open(path: &Path) -> Result<(), String> {
     let stream = link::request(&format!("open {} {name}", body.len()), &body, Duration::from_secs(60))
         .ok_or_else(|| NOT_CONNECTED.to_string())?;
     let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply).map_err(|e| e.to_string())?;
+    let mut stream = stream;
+    stream.read_line(&mut reply).map_err(|e| e.to_string())?;
     match reply.trim_end().split_once(' ') {
         Some(("ok", saved)) => {
             println!("Opened {name} on the other machine, saved as {saved}");

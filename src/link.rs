@@ -1,35 +1,93 @@
-//! The link back to the machine you ssh in from. `rclaude` forwards a loopback port on this host
-//! to a responder there and writes the port and a token to `~/.rclaude-link` on every connect;
-//! each request is one connection that starts with the line `<token> <verb> [args]`. The programs
-//! that use it, `xclip` and `open`, are this binary run under those names.
+//! The link back to the machine you ssh in from. Each `rclaude` connection forwards a loopback port
+//! on this host to a responder there, and records it as `~/.rclaude-links/<port>`, holding a token.
+//! A request is one connection: the line `<token> <verb> [args]`, the responder's hello line
+//! (`rclaude 1`), then the body if any, then the reply. The programs that use it, `xclip` and
+//! `open`, are this binary run under those names.
+//!
+//! Several connections can be open at once, one per pane, and one that has ended leaves its file
+//! behind, so a request tries the newest first and moves on from one that does not answer. A port
+//! nothing listens on is a connection that has ended, and its file is removed.
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const LINK_FILE: &str = ".rclaude-link";
+const LINKS_DIR: &str = ".rclaude-links";
+/// Written by launchers before per-connection files: one link, no hello line.
+const LEGACY_LINK_FILE: &str = ".rclaude-link";
+const HELLO: &str = "rclaude 1";
 
-/// A request sent, its stream ready for the reply; None when no `rclaude` connection is open.
-pub fn request(verb: &str, body: &[u8], read_timeout: Duration) -> Option<TcpStream> {
-    let (port, token) = link()?;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
-    stream.set_read_timeout(Some(read_timeout)).ok()?;
-    stream.write_all(format!("{token} {verb}\n").as_bytes()).ok()?;
-    stream.write_all(body).ok()?;
-    stream.shutdown(std::net::Shutdown::Write).ok()?;
-    Some(stream)
+struct Link {
+    port: u16,
+    token: String,
+    /// The file to remove when nothing listens on the port.
+    file: Option<PathBuf>,
+    /// Whether the responder answers with the hello line.
+    hello: bool,
 }
 
-/// The port and token from `~/.rclaude-link`.
-fn link() -> Option<(u16, String)> {
-    let home = std::env::var_os("HOME")?;
-    let text = std::fs::read_to_string(Path::new(&home).join(LINK_FILE)).ok()?;
+/// A request sent, its stream ready for the reply; None when no `rclaude` connection answers.
+pub fn request(verb: &str, body: &[u8], read_timeout: Duration) -> Option<BufReader<TcpStream>> {
+    links().into_iter().find_map(|link| try_link(&link, verb, body, read_timeout))
+}
+
+fn try_link(link: &Link, verb: &str, body: &[u8], read_timeout: Duration) -> Option<BufReader<TcpStream>> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], link.port));
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::ConnectionRefused
+                && let Some(file) = &link.file
+            {
+                let _ = std::fs::remove_file(file);
+            }
+            return None;
+        }
+    };
+    stream.set_read_timeout(Some(read_timeout)).ok()?;
+    stream.write_all(format!("{} {verb}\n", link.token).as_bytes()).ok()?;
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    if link.hello {
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        if line.trim_end() != HELLO {
+            return None;
+        }
+    }
+    stream.write_all(body).ok()?;
+    stream.shutdown(std::net::Shutdown::Write).ok()?;
+    Some(reader)
+}
+
+/// Every recorded link, newest first, then the legacy one.
+fn links() -> Vec<Link> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
+    let mut links: Vec<(std::time::SystemTime, Link)> = std::fs::read_dir(home.join(LINKS_DIR))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let port = entry.file_name().to_str()?.parse().ok()?;
+            let token = std::fs::read_to_string(entry.path()).ok()?.trim().to_string();
+            let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+            (!token.is_empty()).then(|| (modified, Link { port, token, file: Some(entry.path()), hello: true }))
+        })
+        .collect();
+    links.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let mut links: Vec<Link> = links.into_iter().map(|(_, link)| link).collect();
+    if let Some(legacy) = legacy_link(&home) {
+        links.push(legacy);
+    }
+    links
+}
+
+fn legacy_link(home: &Path) -> Option<Link> {
+    let text = std::fs::read_to_string(home.join(LEGACY_LINK_FILE)).ok()?;
     let mut parts = text.split_whitespace();
-    Some((parts.next()?.parse().ok()?, parts.next()?.to_string()))
+    Some(Link { port: parts.next()?.parse().ok()?, token: parts.next()?.to_string(), file: None, hello: false })
 }
 
 /// Hands the call to the next program called `name` on PATH that is not this one; the status of a

@@ -23,11 +23,11 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Some("image/png") if wants_output => false,
         _ => return link::run_real("xclip", &args),
     };
-    let Some(mut stream) = link::request("clip", b"", Duration::from_secs(10)) else {
+    let Some(stream) = link::request("clip", b"", Duration::from_secs(10)) else {
         return link::run_real("xclip", &args);
     };
     let mut image = Vec::new();
-    let read = (&mut stream).take(MAX_IMAGE + 1).read_to_end(&mut image);
+    let read = stream.take(MAX_IMAGE + 1).read_to_end(&mut image);
     if read.is_err() || image.len() as u64 > MAX_IMAGE || !image.starts_with(PNG_MAGIC) {
         return 1;
     }

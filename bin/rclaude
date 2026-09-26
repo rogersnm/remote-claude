@@ -170,6 +170,7 @@ while (my $client = $server->accept) {
     chomp $line;
     my ($t, $verb, $rest) = split / /, $line, 3;
     if (defined $verb && $t eq $token) {
+      print $client "rclaude 1\n";
       if ($verb eq "clip") {
         unlink $png;
         system("osascript", "-e", "set png_data to (the clipboard as «class PNGf»)",
@@ -252,8 +253,9 @@ start_link() {
 }
 
 # For the host's shell, before anything else: links xclip, open and xdg-open to remote-claude, and
-# records this connection's port and token. Rewritten on every connect, which is how a Claude Code
-# started in an earlier connection finds the new one after a reattach.
+# records this connection as ~/.rclaude-links/<port>, holding its token. One file per connection,
+# so several panes each keep theirs and one ending breaks no other; the host's side tries the
+# newest first, which is how a Claude Code started in an earlier connection finds a later one.
 link_setup() {
   local setup
   setup=$(link_install)
@@ -265,7 +267,7 @@ link_install() {
   printf '%s' 'mkdir -p ~/.local/share/rclaude/bin && for n in xclip open xdg-open; do ln -sfn '"$server"' ~/.local/share/rclaude/bin/$n; done'
 }
 link_record() {
-  printf '%s' "(umask 077 && printf '%s %s\\n' $link_port $link_token > ~/.rclaude-link)"
+  printf '%s' "(umask 077 && mkdir -p ~/.rclaude-links && printf '%s\\n' $link_token > ~/.rclaude-links/$link_port)"
 }
 
 # The PATH the host's programs run with, so they find those links first.
