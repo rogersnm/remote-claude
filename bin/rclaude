@@ -25,6 +25,71 @@ EOF
   exit 2
 }
 
+# Single-quoted for a shell: the local one, or the remote one that splits the command ssh hands it.
+shell_quote() {
+  local escaped="'\\''"
+  printf "'%s'" "${1//\'/$escaped}"
+}
+
+# As shell_quote, but a leading ~/ is left outside the quotes so the remote shell expands it.
+remote_quote() {
+  local s=$1
+  # shellcheck disable=SC2088 # the tilde is for the remote shell to expand
+  if [[ $s == "~/"* ]]; then
+    printf '~/%s' "$(shell_quote "${s#\~/}")"
+  else
+    shell_quote "$s"
+  fi
+}
+
+json_string() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
+# One held connection per host: every server launch and monitor is a channel on it, so a tool
+# call is one round trip. BatchMode because nothing can answer a prompt: the session's stdin and
+# stdout are the MCP stream.
+ssh_opts=(-T
+  -o BatchMode=yes
+  -o ControlMaster=auto
+  -o "ControlPath=$HOME/.ssh/rclaude-%C"
+  -o ControlPersist=10m
+  -o ServerAliveInterval=30)
+
+# The PreToolUse hook on Monitor: rewrites its command to run on the host, in the working tree.
+# Claude Code runs a tool with its original input, here locally, when a hook fails in any way but
+# exit 2, so every failure must become exit 2; the caller maps a non-zero return to it.
+monitor_hook() {
+  local host=$1 cwd=$2 input command script wrapped o
+  input=$(cat) || return 1
+  if ! command=$(jq -er 'select(.tool_input.ws == null) | .tool_input.command // empty' <<<"$input"); then
+    echo "Only command monitors are available in this session, and they run on $host." >&2
+    return 1
+  fi
+  script=$command
+  [[ -z $cwd ]] || script="cd $(remote_quote "$cwd") || exit; $command"
+  wrapped=ssh
+  for o in "${ssh_opts[@]}" "$host" "$script"; do
+    wrapped+=" $(shell_quote "$o")"
+  done
+  jq -n --argjson input "$input" --arg command "$wrapped" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow",
+      updatedInput: ($input.tool_input + {command: $command})}}'
+}
+
+if [[ ${1-} == --monitor-hook ]]; then
+  [[ $# -eq 3 ]] || exit 2
+  if ! out=$(monitor_hook "$2" "$3"); then
+    echo "rclaude: the monitor was not started, because its command could not be moved to $2." >&2
+    exit 2
+  fi
+  printf '%s\n' "$out"
+  exit 0
+fi
+
 [[ $# -gt 0 && $1 != -* ]] || usage
 host=$1
 shift
@@ -59,26 +124,6 @@ done
 name=${name:-$host}
 name=${name//[^A-Za-z0-9_-]/_}
 
-# Single-quoted for the remote shell, which splits the command ssh hands it. A leading ~/ is left
-# outside the quotes so the remote shell expands it; the server path is left bare so $HOME does too.
-remote_quote() {
-  local s=$1 prefix='' escaped="'\\''"
-  # shellcheck disable=SC2088 # the tilde is for the remote shell to expand
-  if [[ $s == "~/"* ]]; then
-    # shellcheck disable=SC2088
-    prefix='~/'
-    s=${s#\~/}
-  fi
-  printf "%s'%s'" "$prefix" "${s//\'/$escaped}"
-}
-
-json_string() {
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  printf '"%s"' "$s"
-}
-
 remote="$server serve"
 for root in ${roots[@]+"${roots[@]}"}; do
   remote+=" --root $(remote_quote "$root")"
@@ -88,31 +133,34 @@ if [[ -n $cwd ]]; then
   remote+=" --cwd $(remote_quote "$cwd")"
 fi
 
-# One held connection per host: every server launch is a channel on it, so a tool call is one
-# round trip. BatchMode because nothing can answer a prompt: the session's stdin and stdout are
-# the MCP stream.
-ssh_args=(-T
-  -o BatchMode=yes
-  -o ControlMaster=auto
-  -o "ControlPath=$HOME/.ssh/rclaude-%C"
-  -o ControlPersist=10m
-  -o ServerAliveInterval=30
-  "$host" "$remote")
 ssh_json=
-for a in "${ssh_args[@]}"; do
+for a in "${ssh_opts[@]}" "$host" "$remote"; do
   ssh_json+=${ssh_json:+, }$(json_string "$a")
 done
 mcp_config="{\"mcpServers\": {$(json_string "$name"): {\"type\": \"stdio\", \"command\": \"ssh\", \"args\": [$ssh_json]}}}"
 
 # A bare-name deny takes a tool out of Claude's context entirely, so Claude sees only the remote
-# set. Every tool that reads local files or runs local commands must be on it: leaving Grep out
-# once had Claude read a local README with it and report it as the remote one, and Monitor runs
-# its command in a local shell. A name the running build lacks draws a startup
-# warning, so retired tools (MultiEdit, NotebookRead, LS) are left off.
+# set. Every tool that reads local files or runs local commands must be on it or redirected:
+# leaving Grep out once had Claude read a local README with it and report it as the remote one. A
+# name the running build lacks draws a startup warning, so retired tools (MultiEdit, NotebookRead,
+# LS) are left off.
+deny='"Read", "Edit", "Write", "NotebookEdit", "Grep", "Glob", "Bash", "DesignSync", "EnterWorktree", "ExitWorktree"'
+hooks=
+monitor_note=
+# Monitor runs its command in a local shell. With jq here to read the hook's input, a hook moves
+# the command to the host; the `|| exit 2` refuses the monitor even if this script cannot run.
+if command -v jq >/dev/null; then
+  self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  hook="$(shell_quote "$self") --monitor-hook $(shell_quote "$host") $(shell_quote "$cwd") || exit 2"
+  hooks=", \"hooks\": {\"PreToolUse\": [{\"matcher\": \"Monitor\", \"hooks\": [{\"type\": \"command\", \"command\": $(json_string "$hook")}]}]}"
+  monitor_note=" Monitor commands run on \`$host\` too, in that directory."
+else
+  deny+=', "Monitor"'
+fi
 settings="{\"permissions\": {
-  \"deny\": [\"Read\", \"Edit\", \"Write\", \"NotebookEdit\", \"Grep\", \"Glob\", \"Bash\", \"Monitor\", \"DesignSync\", \"EnterWorktree\", \"ExitWorktree\"],
+  \"deny\": [$deny],
   \"allow\": [\"mcp__${name}__read\", \"mcp__${name}__edit\", \"mcp__${name}__write\", \"mcp__${name}__bash\", \"mcp__${name}__bash_jobs\"]
-}}"
+}$hooks}"
 
 # Claude Code's environment block (platform, working directory, shell) describes this machine and
 # outranks an MCP server's instructions; without this, asked where it is working, Claude names
@@ -121,7 +169,7 @@ where=${cwd:-the remote home directory}
 prompt="You are working on the remote machine \`$host\`, not on the machine Claude Code runs on. \
 Your only file and shell tools are mcp__${name}__*; there are no local ones. \
 Your working directory is $where on \`$host\`; answer questions about where you are or what you \
-are working on from there, not from the local environment above."
+are working on from there, not from the local environment above.$monitor_note"
 
 # Claude Code keys session history and project memory by the directory it starts in. An empty
 # directory per host and remote working tree gives each its own, and leaves no local checkout to

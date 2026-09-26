@@ -31,7 +31,7 @@ cargo install --locked --git https://github.com/rogersnm/remote-claude
 
 This puts `remote-claude` in `~/.cargo/bin`, which is where the launcher looks by default. Background jobs need `setsid`, which every Linux has (util-linux).
 
-**On your machine** (macOS or Linux, with Claude Code installed), put the launcher on your `PATH`:
+**On your machine** (macOS or Linux, with Claude Code installed, and `jq` for the Monitor tool), put the launcher on your `PATH`:
 
 ```sh
 curl -fsSLo ~/.local/bin/rclaude https://raw.githubusercontent.com/rogersnm/remote-claude/main/bin/rclaude
@@ -67,7 +67,7 @@ Each host and working tree gets its own empty local start directory under `~/.lo
 
 ## How it works
 
-`rclaude` generates three things and passes them to `claude` on the command line. It writes no config files.
+`rclaude` generates four things and passes them to `claude` on the command line. It writes no config files.
 
 **The MCP server.** A stdio server whose command is ssh:
 
@@ -92,13 +92,15 @@ Each host and working tree gets its own empty local start directory under `~/.lo
 ```json
 {
   "permissions": {
-    "deny": ["Read", "Edit", "Write", "NotebookEdit", "Grep", "Glob", "Bash", "Monitor", "DesignSync", "EnterWorktree", "ExitWorktree"],
+    "deny": ["Read", "Edit", "Write", "NotebookEdit", "Grep", "Glob", "Bash", "DesignSync", "EnterWorktree", "ExitWorktree"],
     "allow": ["mcp__myhost__read", "mcp__myhost__edit", "mcp__myhost__write", "mcp__myhost__bash", "mcp__myhost__bash_jobs"]
   }
 }
 ```
 
-The deny list names every tool that reads local files or runs local commands, and all of them matter: with `Grep` still allowed, Claude once read a local README with it and reported it as the remote one. `Monitor` runs its command in a local shell, and `DesignSync` can upload local files. Worktree isolation is local and is denied too; make worktrees by hand with `git worktree` through `bash`.
+The deny list names every tool that reads local files or runs local commands, except Monitor (below), and all of them matter: with `Grep` still allowed, Claude once read a local README with it and reported it as the remote one. `DesignSync` can upload local files. Worktree isolation is local and is denied too; make worktrees by hand with `git worktree` through `bash`.
+
+**A hook that moves Monitor to the remote.** Claude Code's `Monitor` tool streams a command's output lines to Claude as events, and runs that command in a local shell. A `PreToolUse` hook, which is `rclaude` itself in `--monitor-hook` mode, rewrites each command to `ssh <host> 'cd <cwd> || exit; <command>'` on the same held connection, so Claude writes ordinary monitors and they run on the remote. A hook that fails in any other way lets Claude Code run the tool with its original input, locally, so every failure is turned into exit 2, which refuses the call: a monitor with no command (the WebSocket form), a missing `jq`, even a launcher that has been moved away. Without `jq`, `rclaude` denies `Monitor` instead.
 
 **An appended system prompt**, saying the session is working on the remote machine and has no local tools. Claude Code's own environment section (platform, working directory, shell) describes the local machine and ranks above an MCP server's instructions. Without the extra prompt, asked where it is working, Claude names your laptop.
 
@@ -121,6 +123,8 @@ Long foreground commands are also bounded by Claude Code's MCP tool timeout. Rai
 ## Security
 
 `--root` confines the file tools: a path outside every root is refused after symlinks are resolved, so a stray path cannot reach `~/.ssh`. It does not confine `bash`, which runs as your ssh user and can do anything that user can. Treat a session as having your shell on the remote machine, and use a dedicated user or machine if that is too much.
+
+Your own machine is kept out of reach by the deny list and the Monitor hook, which name tools one by one. A future Claude Code release can add a tool that reads local files or runs local commands. After upgrading, ask a session to list its tools and try each unfamiliar one against a local file or `hostname`.
 
 ## Limitations
 
