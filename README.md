@@ -1,6 +1,6 @@
 # remote-claude
 
-Run Claude Code on your laptop while its files and shell live on another machine.
+Run Claude Code on your laptop while its files and shell live on another machine. Or run it on that machine, in tmux, and still paste screenshots from your laptop with ctrl+v.
 
 ```
 Your laptop                                      The remote machine
@@ -65,6 +65,27 @@ Everything else is passed to `claude`, e.g. `rclaude myhost --cwd src/app --resu
 
 Each host and working tree gets its own empty local start directory under `~/.local/state/rclaude/`. Claude Code keys session history and project memory by start directory, so `--resume` lists only the sessions for that remote tree, and there is no local checkout for Claude to confuse with the remote one.
 
+## Or run Claude Code on the remote, with image paste
+
+```sh
+rclaude myhost --on-host --cwd src/myproject
+```
+
+This is the other way round: Claude Code runs on the remote, in a tmux session named after the working tree (`--session` to choose), so it keeps working while your laptop sleeps, and running the command again reattaches. What you would lose by ssh-ing in and running `claude` yourself is pasting a screenshot with ctrl+v, because Claude Code reads the clipboard of the machine it runs on. `--on-host` keeps it:
+
+```
+Your Mac                                          The remote machine
+───────────────────────────────                   ──────────────────────────────────
+rclaude --on-host                                 tmux ─ claude
+  a clipboard responder (perl)                      ctrl+v → xclip -t image/png -o
+          ▲                                                    │  (remote-claude, as xclip)
+          └──── ssh -R 127.0.0.1:<port> ◄──────────────────────┘
+```
+
+On Linux, Claude Code pastes an image by running `xclip -selection clipboard -t TARGETS -o` and `xclip -selection clipboard -t image/png -o`. `--on-host` links `xclip` to `remote-claude` in a directory it puts first on the session's `PATH`; run under that name, it answers those two calls through a port forwarded back to a small responder on your Mac, which reads the clipboard with `osascript` as Claude Code does locally. Any other `xclip` call, and every call while no `rclaude --on-host` connection is open, goes to the real `xclip` if there is one. A token written to `~/.rclaude-clip` (mode 600) on every connect keeps the remote's other users off your clipboard, and lets a Claude Code started in an earlier connection find the new one after you reattach.
+
+On the remote this needs tmux, Claude Code and `remote-claude`. The clipboard side needs macOS; from Linux, `--on-host` still gives you the tmux session, without image paste. A tmux session started some other way does not have the `xclip` on its `PATH`, so start it with `--on-host`.
+
 ## How it works
 
 `rclaude` generates four things and passes them to `claude` on the command line. It writes no config files.
@@ -128,7 +149,7 @@ Your own machine is kept out of reach by the deny list and the Monitor hook, whi
 
 ## Limitations
 
-- The remote must be Linux, because background jobs use `setsid`.
+- The remote must be Linux, because background jobs use `setsid` and `--on-host` stands in for `xclip`.
 - Clickable `file:line` references and the IDE diff view for edits assume local paths, so they do not work.
 - Hooks, skills and anything else that runs a local command still run locally.
 

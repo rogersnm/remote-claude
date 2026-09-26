@@ -15,6 +15,7 @@ use rmcp::{
 };
 use tokio::sync::Mutex;
 
+mod clip;
 mod files;
 mod shell;
 
@@ -259,6 +260,12 @@ fn usage() -> ! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Installed as `xclip` by `rclaude --on-host`, it answers Claude Code's image paste.
+    let mut argv = std::env::args_os();
+    let invoked_as = argv.next().map(PathBuf::from);
+    if invoked_as.as_deref().and_then(|p| p.file_name()).is_some_and(|n| n == "xclip") {
+        std::process::exit(clip::main(argv.collect()));
+    }
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some("serve") {
         usage();

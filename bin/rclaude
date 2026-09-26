@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# rclaude: start Claude Code with its file and shell tools on another machine.
+# rclaude: Claude Code with its work on another machine, in one of two ways.
 #
 #   rclaude <host> [--cwd <dir>] [--root <dir>]... [--server <path>] [--name <name>] [claude args...]
+#     Claude Code runs here; its file and shell tools run on <host>.
+#   rclaude <host> --on-host [--cwd <dir>] [--session <name>] [--server <path>] [claude args...]
+#     Claude Code runs on <host> in tmux, and pasting an image with ctrl+v reads this machine's clipboard.
 #
 # <host> is anything `ssh` accepts (an alias from ~/.ssh/config, user@host, an IP).
 # Every argument rclaude does not recognise is passed to `claude`.
@@ -19,6 +22,10 @@ usage: rclaude <host> [options] [claude args...]
   --server <path>  the remote-claude binary on the host (default: $HOME/.cargo/bin/remote-claude,
                    where `cargo install` puts it; $HOME expands on the host)
   --name <name>    the MCP server name, which prefixes the tool names (default: from <host>)
+  --on-host        run Claude Code on the host instead, in a tmux session that survives
+                   disconnecting, with ctrl+v image paste from this machine's clipboard
+  --session <name> the tmux session for --on-host; an existing one is reattached
+                   (default: the last part of --cwd, or claude)
 
 Anything else is passed to claude, e.g. `rclaude devbox --cwd src/app --resume`.
 EOF
@@ -99,18 +106,25 @@ roots=()
 # shellcheck disable=SC2016 # $HOME is for the remote shell to expand
 server='$HOME/.cargo/bin/remote-claude'
 name=
+on_host=
+session=
 claude_args=()
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --cwd | --root | --server | --name)
+    --cwd | --root | --server | --name | --session)
       [[ $# -ge 2 ]] || usage
       case $1 in
         --cwd) cwd=$2 ;;
         --root) roots+=("$2") ;;
         --server) server=$2 ;;
         --name) name=$2 ;;
+        --session) session=$2 ;;
       esac
       shift 2
+      ;;
+    --on-host)
+      on_host=1
+      shift
       ;;
     -h | --help) usage ;;
     *)
@@ -119,6 +133,84 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Serves this machine's clipboard image to `xclip` on the host (src/clip.rs): for each connection
+# that sends the token, the clipboard as PNG, the way Claude Code itself reads it on macOS, or
+# nothing when it holds no image. Perl because every Mac has it.
+# shellcheck disable=SC2016 # Perl's variables, not the shell's
+clip_responder='
+use strict;
+use IO::Socket::UNIX;
+my ($sock, $token, $png) = @ARGV;
+my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Local => $sock, Listen => 5) or exit 1;
+while (my $client = $server->accept) {
+  my $line = <$client>;
+  if (defined $line) {
+    chomp $line;
+    if ($line eq $token) {
+      unlink $png;
+      system("osascript", "-e", "set png_data to (the clipboard as «class PNGf»)",
+        "-e", "set fp to open for access POSIX file \"$png\" with write permission",
+        "-e", "write png_data to fp", "-e", "close access fp");
+      if (open(my $fh, "<:raw", $png)) { local $/; print $client scalar <$fh>; close $fh; }
+      unlink $png;
+    }
+  }
+  close $client;
+}
+'
+
+# Claude Code on the host, in tmux, over an ssh connection that forwards a loopback port there back
+# to the clipboard responder. Tailscale SSH creates a forwarded Unix socket owned by root, so the
+# forward is a TCP port, and the token keeps the host's other users off this clipboard. The port
+# and token are rewritten on every connect, which is how a Claude Code started in an earlier
+# connection still finds the clipboard after a reattach.
+run_on_host() {
+  local dir token port inner script remote a status
+  if [[ $(uname) == Darwin ]] && command -v perl >/dev/null; then
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/rclaude.XXXXXX")
+    token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    port=$((20000 + RANDOM % 40000))
+    perl -e "$clip_responder" "$dir/clip.sock" "$token" "$dir/clip.png" 2>/dev/null &
+    # Disowned, so killing it at exit prints no job notice.
+    disown
+    # shellcheck disable=SC2064 # expanded now, deliberately
+    trap "kill $! 2>/dev/null; rm -rf $(shell_quote "$dir")" EXIT
+    for _ in $(seq 50); do
+      [[ -S $dir/clip.sock ]] && break
+      sleep 0.1
+    done
+  else
+    echo "rclaude: pasting images from this machine needs macOS; continuing without it" >&2
+  fi
+
+  # shellcheck disable=SC2016 # for tmux's shell on the host to expand
+  inner='PATH="$HOME/.local/share/rclaude/bin:$PATH" exec claude'
+  for a in ${claude_args[@]+"${claude_args[@]}"}; do
+    inner+=" $(shell_quote "$a")"
+  done
+  script='mkdir -p ~/.local/share/rclaude/bin && ln -sfn '"$server"' ~/.local/share/rclaude/bin/xclip'
+  [[ -z $port ]] || script+=" && (umask 077 && printf '%s %s\n' $port $token > ~/.rclaude-clip)"
+  script+=" && exec tmux new-session -A -s $(shell_quote "$session")"
+  [[ -z $cwd ]] || script+=" -c $(remote_quote "$cwd")"
+  script+=" $(shell_quote "$inner")"
+  # A login shell, so PATH has whatever the user's profile adds, such as where claude is installed.
+  # shellcheck disable=SC2016 # for the host's shell to expand
+  remote='exec "${SHELL:-/bin/sh}" -lc '"$(shell_quote "$script")"
+
+  local ssh=(ssh -t -o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=30)
+  [[ -z $port ]] || ssh+=(-o ExitOnForwardFailure=yes -R "127.0.0.1:$port:$dir/clip.sock")
+  status=0
+  "${ssh[@]}" "$host" "$remote" || status=$?
+  return $status
+}
+
+if [[ -n $on_host ]]; then
+  session=${session:-$(basename "${cwd:-claude}")}
+  session=${session//[^A-Za-z0-9_-]/_}
+  run_on_host
+  exit $?
+fi
 
 # The MCP server name is part of every tool name (mcp__<name>__read), which allows only these characters.
 name=${name:-$host}
