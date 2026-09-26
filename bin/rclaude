@@ -105,11 +105,11 @@ done
 mcp_config="{\"mcpServers\": {$(json_string "$name"): {\"type\": \"stdio\", \"command\": \"ssh\", \"args\": [$ssh_json]}}}"
 
 # A bare-name deny takes a tool out of Claude's context entirely, so Claude sees only the remote
-# set. The list names every local file and shell tool a Claude Code build may carry; a name a
-# build lacks draws a warning and is otherwise ignored. Leaving Grep out once had Claude read a
-# local README with it and report it as the remote one.
+# set. Every local file and shell tool must be on it: leaving Grep out once had Claude read a local
+# README with it and report it as the remote one. A name the running build lacks draws a startup
+# warning, so retired tools (MultiEdit, NotebookRead, LS) are left off.
 settings="{\"permissions\": {
-  \"deny\": [\"Read\", \"Edit\", \"Write\", \"MultiEdit\", \"NotebookEdit\", \"NotebookRead\", \"Grep\", \"Glob\", \"LS\", \"Bash\", \"EnterWorktree\", \"ExitWorktree\"],
+  \"deny\": [\"Read\", \"Edit\", \"Write\", \"NotebookEdit\", \"Grep\", \"Glob\", \"Bash\", \"EnterWorktree\", \"ExitWorktree\"],
   \"allow\": [\"mcp__${name}__read\", \"mcp__${name}__edit\", \"mcp__${name}__write\", \"mcp__${name}__bash\", \"mcp__${name}__bash_jobs\"]
 }}"
 
