@@ -65,7 +65,7 @@ Everything else is passed to `claude`, e.g. `rclaude myhost --cwd src/app --resu
 
 Each host and working tree gets its own empty local start directory under `~/.local/state/rclaude/`. Claude Code keys session history and project memory by start directory, so `--resume` lists only the sessions for that remote tree, and there is no local checkout for Claude to confuse with the remote one.
 
-## Or run Claude Code on the remote, with image paste
+## Or run Claude Code on the remote, with image paste and `open`
 
 ```sh
 rclaude myhost --on-host --cwd src/myproject
@@ -82,9 +82,15 @@ rclaude --on-host                                 tmux ─ claude
           └──── ssh -R 127.0.0.1:<port> ◄──────────────────────┘
 ```
 
-On Linux, Claude Code pastes an image by running `xclip -selection clipboard -t TARGETS -o` and `xclip -selection clipboard -t image/png -o`. `--on-host` links `xclip` to `remote-claude` in a directory it puts first on the session's `PATH`; run under that name, it answers those two calls through a port forwarded back to a small responder on your Mac, which reads the clipboard with `osascript` as Claude Code does locally. Any other `xclip` call, and every call while no `rclaude --on-host` connection is open, goes to the real `xclip` if there is one. A token written to `~/.rclaude-clip` (mode 600) on every connect keeps the remote's other users off your clipboard, and lets a Claude Code started in an earlier connection find the new one after you reattach.
+On Linux, Claude Code pastes an image by running `xclip -selection clipboard -t TARGETS -o` and `xclip -selection clipboard -t image/png -o`. `--on-host` links `xclip` to `remote-claude` in a directory it puts first on the session's `PATH`; run under that name, it answers those two calls through a port forwarded back to a small responder on your Mac, which reads the clipboard with `osascript` as Claude Code does locally. Any other `xclip` call, and every call while no `rclaude` connection is open, goes to the real `xclip` if there is one. A token written to `~/.rclaude-link` (mode 600) on every connect keeps the remote's other users off the link, and lets a Claude Code started in an earlier connection find the new one after you reattach.
 
-On the remote this needs tmux, Claude Code and `remote-claude`. The clipboard side needs macOS; from Linux, `--on-host` still gives you the tmux session, without image paste. A tmux session started some other way does not have the `xclip` on its `PATH`, so start it with `--on-host`.
+`--command <cmd>` runs a shell command in a new tmux session instead of `claude`; a Claude Code that command starts still gets the link.
+
+On the remote this needs tmux, Claude Code and `remote-claude`. The link needs macOS; from Linux, `--on-host` still gives you the tmux session, without it. A tmux session started some other way does not have the links on its `PATH`, so start it with `rclaude`.
+
+### Opening files on your Mac
+
+In both modes, `open <file>` and `xdg-open <file>` on the remote are `remote-claude` too: they copy each file over the same link, and your Mac saves it to `~/Downloads/rclaude/<host>/` and opens it, so asking Claude to show you a PDF or a screenshot it made just works. The Mac decides what it will open, not the remote: documents, images, audio and video by extension (pdf, png, jpg, gif, webp, heic, svg, html, md, txt, csv, tsv, json, log, mp4, mov, webm, mp3, wav), up to 100 MB, never programs or scripts, since opening a `.command` or an `.app` would run it. Each copy carries macOS's quarantine flag, like any download. URLs are refused; only files cross.
 
 ## How it works
 

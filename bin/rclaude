@@ -3,7 +3,7 @@
 #
 #   rclaude <host> [--cwd <dir>] [--root <dir>]... [--server <path>] [--name <name>] [claude args...]
 #     Claude Code runs here; its file and shell tools run on <host>.
-#   rclaude <host> --on-host [--cwd <dir>] [--session <name>] [--server <path>] [claude args...]
+#   rclaude <host> --on-host [--cwd <dir>] [--session <name>] [--command <cmd>] [--server <path>] [claude args...]
 #     Claude Code runs on <host> in tmux, and pasting an image with ctrl+v reads this machine's clipboard.
 #
 # <host> is anything `ssh` accepts (an alias from ~/.ssh/config, user@host, an IP).
@@ -26,6 +26,8 @@ usage: rclaude <host> [options] [claude args...]
                    disconnecting, with ctrl+v image paste from this machine's clipboard
   --session <name> the tmux session for --on-host; an existing one is reattached
                    (default: the last part of --cwd, or claude)
+  --command <cmd>  for --on-host, a shell command for a new tmux session to run instead of
+                   claude; a claude it starts still pastes from this machine's clipboard
 
 Anything else is passed to claude, e.g. `rclaude devbox --cwd src/app --resume`.
 EOF
@@ -108,10 +110,11 @@ server='$HOME/.cargo/bin/remote-claude'
 name=
 on_host=
 session=
+command=
 claude_args=()
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --cwd | --root | --server | --name | --session)
+    --cwd | --root | --server | --name | --session | --command)
       [[ $# -ge 2 ]] || usage
       case $1 in
         --cwd) cwd=$2 ;;
@@ -119,6 +122,7 @@ while [[ $# -gt 0 ]]; do
         --server) server=$2 ;;
         --name) name=$2 ;;
         --session) session=$2 ;;
+        --command) command=$2 ;;
       esac
       shift 2
       ;;
@@ -134,64 +138,123 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Serves this machine's clipboard image to `xclip` on the host (src/clip.rs): for each connection
-# that sends the token, the clipboard as PNG, the way Claude Code itself reads it on macOS, or
-# nothing when it holds no image. Perl because every Mac has it.
+# The link back to this machine (src/link.rs): the host's `xclip` and `open` are remote-claude
+# under those names, and reach this responder through a forwarded port with the token. `clip`
+# answers with the clipboard as PNG, read the way Claude Code itself reads it on macOS, or nothing.
+# `open <size> <name>` takes a file and opens a copy here, if it is a document or an image: the
+# host does not decide what this machine opens, so the name is cleaned and the type checked here,
+# and the copy is quarantined like any download. Perl because every Mac has it.
 # shellcheck disable=SC2016 # Perl's variables, not the shell's
-clip_responder='
+link_responder='
 use strict;
 use IO::Socket::UNIX;
-my ($sock, $token, $png) = @ARGV;
+use File::Path qw(make_path);
+my ($sock, $token, $png, $downloads) = @ARGV;
+my %openable = map { $_ => 1 } qw(pdf png jpg jpeg gif webp heic svg html htm md txt csv tsv json log mp4 mov webm mp3 wav);
+my $max = 100 << 20;
 my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Local => $sock, Listen => 5) or exit 1;
 while (my $client = $server->accept) {
   my $line = <$client>;
   if (defined $line) {
     chomp $line;
-    if ($line eq $token) {
-      unlink $png;
-      system("osascript", "-e", "set png_data to (the clipboard as «class PNGf»)",
-        "-e", "set fp to open for access POSIX file \"$png\" with write permission",
-        "-e", "write png_data to fp", "-e", "close access fp");
-      if (open(my $fh, "<:raw", $png)) { local $/; print $client scalar <$fh>; close $fh; }
-      unlink $png;
+    my ($t, $verb, $rest) = split / /, $line, 3;
+    if (defined $verb && $t eq $token) {
+      if ($verb eq "clip") {
+        unlink $png;
+        system("osascript", "-e", "set png_data to (the clipboard as «class PNGf»)",
+          "-e", "set fp to open for access POSIX file \"$png\" with write permission",
+          "-e", "write png_data to fp", "-e", "close access fp");
+        if (open(my $fh, "<:raw", $png)) { local $/; print $client scalar <$fh>; close $fh; }
+        unlink $png;
+      } elsif ($verb eq "open") {
+        print $client open_file($client, $rest // "");
+      }
     }
   }
   close $client;
 }
+sub open_file {
+  my ($client, $rest) = @_;
+  my ($size, $name) = split / /, $rest, 2;
+  return "error bad request\n" unless defined $name && $size =~ /^\d+$/;
+  return "error larger than 100 MB\n" if $size > $max;
+  $name =~ s{.*/}{};
+  $name =~ s/[^A-Za-z0-9._ -]/_/g;
+  $name =~ s/^[. ]+//;
+  my ($stem, $ext) = $name =~ /^(.+)\.([A-Za-z0-9]+)$/;
+  return "error only documents and images are opened, and $name is neither\n" unless defined $ext && $openable{lc $ext};
+  my $body = "";
+  while (length($body) < $size) {
+    my $n = read($client, $body, $size - length($body), length($body));
+    return "error the file arrived incomplete\n" unless $n;
+  }
+  make_path($downloads);
+  my $path = "$downloads/$name";
+  for (my $i = 1; -e $path; $i++) { $path = "$downloads/$stem-$i.$ext"; }
+  open(my $fh, ">:raw", $path) or return "error cannot write $path\n";
+  print $fh $body;
+  close $fh;
+  system("xattr", "-w", "com.apple.quarantine", sprintf("0081;%x;rclaude;", time), $path);
+  system("open", $path) == 0 or return "error saved $path but could not open it\n";
+  return "ok $path\n";
+}
 '
 
-# Claude Code on the host, in tmux, over an ssh connection that forwards a loopback port there back
-# to the clipboard responder. Tailscale SSH creates a forwarded Unix socket owned by root, so the
-# forward is a TCP port, and the token keeps the host's other users off this clipboard. The port
-# and token are rewritten on every connect, which is how a Claude Code started in an earlier
-# connection still finds the clipboard after a reattach.
-run_on_host() {
-  local dir token port inner script remote a status
-  if [[ $(uname) == Darwin ]] && command -v perl >/dev/null; then
-    dir=$(mktemp -d "${TMPDIR:-/tmp}/rclaude.XXXXXX")
-    token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    port=$((20000 + RANDOM % 40000))
-    perl -e "$clip_responder" "$dir/clip.sock" "$token" "$dir/clip.png" 2>/dev/null &
-    # Disowned, so killing it at exit prints no job notice.
-    disown
-    # shellcheck disable=SC2064 # expanded now, deliberately
-    trap "kill $! 2>/dev/null; rm -rf $(shell_quote "$dir")" EXIT
-    for _ in $(seq 50); do
-      [[ -S $dir/clip.sock ]] && break
-      sleep 0.1
-    done
-  else
-    echo "rclaude: pasting images from this machine needs macOS; continuing without it" >&2
-  fi
-
-  # shellcheck disable=SC2016 # for tmux's shell on the host to expand
-  inner='PATH="$HOME/.local/share/rclaude/bin:$PATH" exec claude'
-  for a in ${claude_args[@]+"${claude_args[@]}"}; do
-    inner+=" $(shell_quote "$a")"
+# Starts the responder and sets link_port and link_token, on macOS; elsewhere leaves them empty and
+# the host's `xclip` and `open` find no link. Tailscale SSH creates a forwarded Unix socket owned by
+# root, so the forward is a TCP port on the host's loopback, and the token keeps the host's other
+# users off it.
+link_port=
+link_token=
+link_sock=
+start_link() {
+  local dir downloads
+  [[ $(uname) == Darwin ]] && command -v perl >/dev/null || return 0
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/rclaude.XXXXXX")
+  downloads=$HOME/Downloads/rclaude/${host//[^A-Za-z0-9_.-]/_}
+  link_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  link_port=$((20000 + RANDOM % 40000))
+  link_sock=$dir/link.sock
+  perl -e "$link_responder" "$link_sock" "$link_token" "$dir/clip.png" "$downloads" 2>/dev/null &
+  # Disowned, so killing it at exit prints no job notice.
+  disown
+  # shellcheck disable=SC2064 # expanded now, deliberately
+  trap "kill $! 2>/dev/null; rm -rf $(shell_quote "$dir")" EXIT
+  for _ in $(seq 50); do
+    [[ -S $link_sock ]] && break
+    sleep 0.1
   done
-  script='mkdir -p ~/.local/share/rclaude/bin && ln -sfn '"$server"' ~/.local/share/rclaude/bin/xclip'
-  [[ -z $port ]] || script+=" && (umask 077 && printf '%s %s\n' $port $token > ~/.rclaude-clip)"
-  script+=" && exec tmux new-session -A -s $(shell_quote "$session")"
+}
+
+# For the host's shell, before anything else: links xclip, open and xdg-open to remote-claude, and
+# records this connection's port and token. Rewritten on every connect, which is how a Claude Code
+# started in an earlier connection finds the new one after a reattach.
+link_setup() {
+  # shellcheck disable=SC2016 # for the host's shell to expand
+  local setup='mkdir -p ~/.local/share/rclaude/bin && for n in xclip open xdg-open; do ln -sfn '"$server"' ~/.local/share/rclaude/bin/$n; done'
+  [[ -z $link_port ]] || setup+=" && (umask 077 && printf '%s %s\n' $link_port $link_token > ~/.rclaude-link)"
+  printf '%s' "$setup"
+}
+
+# The PATH the host's programs run with, so they find those links first.
+# shellcheck disable=SC2016 # for the host's shell to expand
+link_path='PATH="$HOME/.local/share/rclaude/bin:$PATH"; export PATH'
+
+# Claude Code on the host, in tmux, over an ssh connection that carries the link.
+run_on_host() {
+  local inner script remote a status
+  start_link
+  [[ -n $link_port ]] || echo "rclaude: pasting and opening on this machine need macOS; continuing without them" >&2
+  inner="$link_path; "
+  if [[ -n $command ]]; then
+    inner+=$command
+  else
+    inner+='exec claude'
+    for a in ${claude_args[@]+"${claude_args[@]}"}; do
+      inner+=" $(shell_quote "$a")"
+    done
+  fi
+  script="$(link_setup) && exec tmux new-session -A -s $(shell_quote "$session")"
   [[ -z $cwd ]] || script+=" -c $(remote_quote "$cwd")"
   script+=" $(shell_quote "$inner")"
   # A login shell, so PATH has whatever the user's profile adds, such as where claude is installed.
@@ -199,7 +262,7 @@ run_on_host() {
   remote='exec "${SHELL:-/bin/sh}" -lc '"$(shell_quote "$script")"
 
   local ssh=(ssh -t -o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=30)
-  [[ -z $port ]] || ssh+=(-o ExitOnForwardFailure=yes -R "127.0.0.1:$port:$dir/clip.sock")
+  [[ -z $link_port ]] || ssh+=(-o ExitOnForwardFailure=yes -R "127.0.0.1:$link_port:$link_sock")
   status=0
   "${ssh[@]}" "$host" "$remote" || status=$?
   return $status
@@ -216,7 +279,9 @@ fi
 name=${name:-$host}
 name=${name//[^A-Za-z0-9_-]/_}
 
-remote="$server serve"
+# The link rides the MCP server's connection, so `open` in the remote bash reaches this machine.
+start_link
+remote="$(link_setup) && $link_path && exec $server serve"
 for root in ${roots[@]+"${roots[@]}"}; do
   remote+=" --root $(remote_quote "$root")"
 done
@@ -225,8 +290,10 @@ if [[ -n $cwd ]]; then
   remote+=" --cwd $(remote_quote "$cwd")"
 fi
 
+mcp_ssh=("${ssh_opts[@]}")
+[[ -z $link_port ]] || mcp_ssh+=(-R "127.0.0.1:$link_port:$link_sock")
 ssh_json=
-for a in "${ssh_opts[@]}" "$host" "$remote"; do
+for a in "${mcp_ssh[@]}" "$host" "$remote"; do
   ssh_json+=${ssh_json:+, }$(json_string "$a")
 done
 mcp_config="{\"mcpServers\": {$(json_string "$name"): {\"type\": \"stdio\", \"command\": \"ssh\", \"args\": [$ssh_json]}}}"
@@ -262,6 +329,8 @@ prompt="You are working on the remote machine \`$host\`, not on the machine Clau
 Your only file and shell tools are mcp__${name}__*; there are no local ones. \
 Your working directory is $where on \`$host\`; answer questions about where you are or what you \
 are working on from there, not from the local environment above.$monitor_note"
+[[ -z $link_port ]] || prompt+=" To show the user a document or image, run \`open <file>\` on \`$host\`: \
+it opens a copy on the machine they are at."
 
 # Claude Code keys session history and project memory by the directory it starts in. An empty
 # directory per host and remote working tree gives each its own, and leaves no local checkout to
@@ -272,5 +341,8 @@ state=${XDG_STATE_HOME:-$HOME/.local/state}/rclaude/$name/$tree
 mkdir -p "$state"
 cd "$state"
 
-exec claude --strict-mcp-config --settings "$settings" --append-system-prompt "$prompt" \
-  ${claude_args[@]+"${claude_args[@]}"} --mcp-config "$mcp_config"
+# Not exec'd: the link's responder is stopped when Claude Code exits.
+status=0
+claude --strict-mcp-config --settings "$settings" --append-system-prompt "$prompt" \
+  ${claude_args[@]+"${claude_args[@]}"} --mcp-config "$mcp_config" || status=$?
+exit $status
