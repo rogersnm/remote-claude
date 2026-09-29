@@ -1,6 +1,7 @@
 //! The shell tool: one `bash -c` per call with a working directory that persists
 //! between calls, output capped, a timeout, and detached background jobs.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -72,7 +73,7 @@ pub async fn run(command: &str, cwd: &Path, timeout_ms: u64) -> Result<Run> {
     Ok(Run { output: cap(output), status, timed_out, cwd: new_cwd })
 }
 
-/// Detached background jobs: each runs under `setsid`, writes its output to a
+/// Detached background jobs: each runs in its own session, writes its output to a
 /// file and its exit code to another, so it outlives the server process (and an
 /// ssh drop) and any later server instance can still read it.
 pub struct Jobs {
@@ -98,24 +99,27 @@ impl Jobs {
         let status = self.dir.join(format!("{id}.status"));
         let meta = self.dir.join(format!("{id}.cmd"));
         std::fs::write(&meta, format!("{}\n{}\n", description.unwrap_or(""), command))?;
-        // bash under setsid: its own session and group; the pid file names the
-        // shell so `stop` can kill the whole group later.
+        // bash in its own session and group; the pid file names the shell so
+        // `stop` can kill the whole group later. setsid(2) in the child rather
+        // than the setsid(1) command, which macOS does not have.
         let script = format!(
             "echo $$ > {pidf}; ( {command} ) > {out} 2>&1; echo $? > {status}",
             pidf = shell_quote(&self.dir.join(format!("{id}.pid"))),
             out = shell_quote(&out),
             status = shell_quote(&status),
         );
-        std::process::Command::new("setsid")
-            .arg("bash")
-            .arg("-c")
-            .arg(&script)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("cannot start the background job (is setsid installed?)")?;
+        let mut bash = std::process::Command::new("bash");
+        bash.arg("-c").arg(&script).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        // SAFETY: setsid is async-signal-safe, and the closure touches nothing else.
+        unsafe {
+            bash.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        bash.spawn().context("cannot start the background job")?;
         Ok(Job { id, out })
     }
 
@@ -225,6 +229,36 @@ mod tests {
         let r = run("sleep 5; echo late", &tmp, 200).await.unwrap();
         assert!(r.timed_out);
         assert!(!r.output.contains("late"));
+    }
+
+    /// A job leads its own session, which is what lets `stop` kill its whole group, and it
+    /// records its exit code. Runs on macOS too, which has no setsid(1).
+    #[test]
+    fn jobs_run_in_their_own_session() {
+        let jobs = Jobs::open().unwrap();
+        let tmp = std::env::temp_dir();
+        let job = jobs.start("sleep 30", &tmp, Some("session test")).unwrap();
+        let pid_file = jobs.dir.join(format!("{}.pid", job.id));
+        let mut pid = None;
+        for _ in 0..100 {
+            pid = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<i32>().ok());
+            if pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.expect("the job never wrote its pid");
+        assert_eq!(unsafe { libc::getsid(pid) }, pid);
+        jobs.stop(&job.id).unwrap();
+
+        let done = jobs.start("exit 7", &tmp, None).unwrap();
+        for _ in 0..100 {
+            if jobs.status(&done.id) != "running" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(jobs.status(&done.id), "finished, exit code 7");
     }
 
     #[test]

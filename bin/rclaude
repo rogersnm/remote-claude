@@ -252,7 +252,8 @@ start_link() {
   done
 }
 
-# For the host's shell, before anything else: links xclip, open and xdg-open to remote-claude, and
+# For the host's shell, before anything else: links xclip, osascript, open and xdg-open to
+# remote-claude (xclip is how Claude Code reads the clipboard on Linux, osascript on macOS), and
 # records this connection as ~/.rclaude-links/<port>, holding its token. One file per connection,
 # so several panes each keep theirs and one ending breaks no other; the host's side tries the
 # newest first, which is how a Claude Code started in an earlier connection finds a later one.
@@ -264,7 +265,7 @@ link_setup() {
 }
 link_install() {
   # shellcheck disable=SC2016 # for the host's shell to expand
-  printf '%s' 'mkdir -p ~/.local/share/rclaude/bin && for n in xclip open xdg-open; do ln -sfn '"$server"' ~/.local/share/rclaude/bin/$n; done'
+  printf '%s' 'mkdir -p ~/.local/share/rclaude/bin && for n in xclip osascript open xdg-open; do ln -sfn '"$server"' ~/.local/share/rclaude/bin/$n; done'
 }
 link_record() {
   printf '%s' "(umask 077 && mkdir -p ~/.rclaude-links && printf '%s\\n' $link_token > ~/.rclaude-links/$link_port)"

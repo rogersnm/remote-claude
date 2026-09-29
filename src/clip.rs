@@ -23,17 +23,35 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Some("image/png") if wants_output => false,
         _ => return link::run_real("xclip", &args),
     };
+    let image = match fetch_png() {
+        Fetched::NotConnected => return link::run_real("xclip", &args),
+        Fetched::NoImage => return 1,
+        Fetched::Png(image) => image,
+    };
+    let mut out = std::io::stdout().lock();
+    let written = if targets { out.write_all(b"image/png\n") } else { out.write_all(&image) };
+    if written.and_then(|_| out.flush()).is_ok() { 0 } else { 1 }
+}
+
+pub enum Fetched {
+    /// No `rclaude` connection is open: the caller falls back to the real program.
+    NotConnected,
+    /// Connected, but the clipboard holds no PNG (or one too large to take).
+    NoImage,
+    Png(Vec<u8>),
+}
+
+/// The clipboard of the machine you ssh in from, as PNG. Shared by `xclip` and `osascript`.
+pub fn fetch_png() -> Fetched {
     let Some(stream) = link::request("clip", b"", Duration::from_secs(10)) else {
-        return link::run_real("xclip", &args);
+        return Fetched::NotConnected;
     };
     let mut image = Vec::new();
     let read = stream.take(MAX_IMAGE + 1).read_to_end(&mut image);
     if read.is_err() || image.len() as u64 > MAX_IMAGE || !image.starts_with(PNG_MAGIC) {
-        return 1;
+        return Fetched::NoImage;
     }
-    let mut out = std::io::stdout().lock();
-    let written = if targets { out.write_all(b"image/png\n") } else { out.write_all(&image) };
-    if written.and_then(|_| out.flush()).is_ok() { 0 } else { 1 }
+    Fetched::Png(image)
 }
 
 /// The value of `-t`/`-target`.

@@ -19,6 +19,7 @@ mod clip;
 mod files;
 mod link;
 mod open;
+mod osascript;
 mod shell;
 
 /// Parameters of `read`, the same as Claude Code's `Read`.
@@ -262,11 +263,12 @@ fn usage() -> ! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Linked in as `xclip`, `open` and `xdg-open` by `rclaude`: see link.rs.
+    // Linked in as `xclip`, `osascript`, `open` and `xdg-open` by `rclaude`: see link.rs.
     let mut argv = std::env::args_os();
     let invoked_as = argv.next().map(PathBuf::from);
     match invoked_as.as_deref().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
         Some("xclip") => std::process::exit(clip::main(argv.collect())),
+        Some("osascript") => std::process::exit(osascript::main(argv.collect())),
         Some(name @ ("open" | "xdg-open")) => std::process::exit(open::main(name, argv.collect())),
         _ => {}
     }
