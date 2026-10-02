@@ -178,15 +178,15 @@ while (my $client = $server->accept) {
           "-e", "write png_data to fp", "-e", "close access fp");
         if (open(my $fh, "<:raw", $png)) { local $/; print $client scalar <$fh>; close $fh; }
         unlink $png;
-      } elsif ($verb eq "open") {
-        print $client open_file($client, $rest // "");
+      } elsif ($verb eq "open" || $verb eq "reveal") {
+        print $client open_file($client, $rest // "", $verb eq "reveal");
       }
     }
   }
   close $client;
 }
 sub open_file {
-  my ($client, $rest) = @_;
+  my ($client, $rest, $reveal) = @_;
   my ($size, $name) = split / /, $rest, 2;
   return "error bad request\n" unless defined $name && $size =~ /^\d+$/;
   return "error larger than 100 MB\n" if $size > $max;
@@ -207,7 +207,7 @@ sub open_file {
   print $fh $body;
   close $fh;
   system("xattr", "-w", "com.apple.quarantine", sprintf("0081;%x;rclaude;", time), $path);
-  system("open", $path) == 0 or return "error saved $path but could not open it\n";
+  system("open", $reveal ? ("-R", $path) : ($path)) == 0 or return "error saved $path but could not open it\n";
   return "ok $path\n";
 }
 '
@@ -293,9 +293,14 @@ run_on_host() {
       inner+=" $(shell_quote "$a")"
     done
   fi
-  script="exec tmux new-session -A -s $(shell_quote "$session")"
+  script="tmux new-session -A -s $(shell_quote "$session")"
   [[ -z $cwd ]] || script+=" -c $(remote_quote "$cwd")"
   script+=" $(shell_quote "$inner")"
+  # Claude Code on a macOS host reads a pasted image natively from that machine's own pasteboard,
+  # never asking the osascript link (src/paste.rs), so there ctrl+v is bound in tmux to put this
+  # machine's clipboard image on the host's pasteboard first, then send the key on to the pane.
+  # shellcheck disable=SC2016 # for the host's shell to expand
+  script='if [ "$(uname)" = Darwin ]; then exec '"$script"' \; bind-key -n C-v run-shell "'"$server"' paste-sync #{pane_id}"; else exec '"$script"'; fi'
 
   local ssh=(ssh -o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=30)
   if [[ -z $no_mosh ]] && command -v mosh >/dev/null &&

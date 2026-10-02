@@ -20,6 +20,7 @@ mod files;
 mod link;
 mod open;
 mod osascript;
+mod paste;
 mod shell;
 
 /// Parameters of `read`, the same as Claude Code's `Read`.
@@ -273,6 +274,11 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
     let mut args = std::env::args().skip(1);
+    let first = args.next();
+    if first.as_deref() == Some("paste-sync") {
+        std::process::exit(paste::main(args.next().as_deref()));
+    }
+    let mut args = first.into_iter().chain(args);
     if args.next().as_deref() != Some("serve") {
         usage();
     }
