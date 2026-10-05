@@ -319,7 +319,9 @@ run_on_host() {
           "${ssh[@]}" -tt -o ExitOnForwardFailure=yes -R "127.0.0.1:$link_port:$link_sock" "$host" \
             "$(link_record) && exec sleep 2147483647" </dev/null >/dev/null 2>&1 &
           child=$!
-          wait "$child"
+          # A dropped connection is ssh failing, and set -e would end the loop on it, for good:
+          # one reboot of the host once left every open pane without a link.
+          wait "$child" || true
           sleep 5
         done
       ) &
