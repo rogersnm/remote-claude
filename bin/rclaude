@@ -281,7 +281,7 @@ link_daemon() {
   sock=$dir/link.sock
   link_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   link_port=$((20000 + RANDOM % 40000))
-  # shellcheck disable=SC2329 # run by the trap
+  # shellcheck disable=SC2317,SC2329 # run by the trap
   stop() {
     [[ -z $child ]] || kill "$child" 2>/dev/null
     [[ -z $resp ]] || kill "$resp" 2>/dev/null
