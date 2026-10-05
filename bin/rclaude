@@ -40,6 +40,9 @@ EOF
   exit 2
 }
 
+# This script, by absolute path: the Monitor hook and the link daemon run it again.
+self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
 # Single-quoted for a shell: the local one, or the remote one that splits the command ssh hands it.
 shell_quote() {
   local escaped="'\\''"
@@ -116,6 +119,7 @@ server='$HOME/.cargo/bin/remote-claude'
 name=
 on_host=
 no_mosh=
+daemon=
 session=
 command=
 claude_args=()
@@ -139,6 +143,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ssh)
       no_mosh=1
+      shift
+      ;;
+    --link-daemon)
+      daemon=1
       shift
       ;;
     -h | --help) usage ;;
@@ -212,20 +220,24 @@ sub open_file {
 }
 '
 
-# Starts the responder and sets link_port and link_token, on macOS; elsewhere leaves them empty and
-# the host's `xclip` and `open` find no link. Tailscale SSH creates a forwarded Unix socket owned by
-# root, so the forward is a TCP port on the host's loopback, and the token keeps the host's other
-# users off it.
+# The link back to this machine (src/link.rs) is one per host, shared by every rclaude session to
+# it: the responder above and one ssh carrying a forwarded port to it, kept connected by
+# `rclaude <host> --link-daemon` for as long as any session to that host is open. One per pane
+# meant one connection per pane, and a burst of them after the host restarted. Tailscale SSH
+# creates a forwarded Unix socket owned by root, so the forward is a TCP port on the host's
+# loopback, and the token keeps the host's other users off it. macOS only: elsewhere link_port
+# stays empty and the host's `xclip` and `open` find no link.
 link_port=
 link_token=
-link_sock=
-# Background processes and the scratch directory, stopped and removed on exit.
-cleanup_pids=()
-cleanup_dir=
+link_root=${XDG_STATE_HOME:-$HOME/.local/state}/rclaude/link
+link_dir_for() { printf '%s/%s' "$link_root" "${1//[^A-Za-z0-9_.@-]/_}"; }
+link_alive() { [[ -f $1/pid ]] && kill -0 "$(cat "$1/pid")" 2>/dev/null; }
+
+# This session's registration, removed on exit; the daemon stops once none are left.
+cleanup_files=()
 # shellcheck disable=SC2317,SC2329 # run by the trap
 cleanup() {
-  [[ ${#cleanup_pids[@]} -eq 0 ]] || kill "${cleanup_pids[@]}" 2>/dev/null
-  [[ -z $cleanup_dir ]] || rm -rf "$cleanup_dir"
+  [[ ${#cleanup_files[@]} -eq 0 ]] || rm -f "${cleanup_files[@]}"
 }
 trap cleanup EXIT
 # A closed terminal is a hangup, which would end this without the EXIT trap.
@@ -233,36 +245,87 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-start_link() {
-  local dir downloads
+# Joins the host's link, starting it if no session has: sets link_port.
+use_link() {
+  local dir
   [[ $(uname) == Darwin ]] && command -v perl >/dev/null || return 0
-  dir=$(mktemp -d "${TMPDIR:-/tmp}/rclaude.XXXXXX")
-  downloads=$HOME/Downloads/rclaude/${host//[^A-Za-z0-9_.-]/_}
+  dir=$(link_dir_for "$host")
+  mkdir -p "$dir/users"
+  : >"$dir/users/$$"
+  cleanup_files+=("$dir/users/$$")
+  if ! link_alive "$dir"; then
+    # One starter at a time; a lock older than a minute is from a starter that died.
+    if mkdir "$dir/lock" 2>/dev/null || { [[ -n $(find "$dir/lock" -maxdepth 0 -mmin +1 2>/dev/null) ]] && rm -rf "$dir/lock" && mkdir "$dir/lock" 2>/dev/null; }; then
+      if ! link_alive "$dir"; then
+        rm -f "$dir/port"
+        nohup "$self" "$host" --link-daemon >/dev/null 2>&1 </dev/null &
+        disown
+      fi
+      rmdir "$dir/lock"
+    fi
+  fi
+  for _ in $(seq 50); do
+    [[ -s $dir/port ]] && break
+    sleep 0.1
+  done
+  link_port=$(cat "$dir/port" 2>/dev/null || true)
+}
+
+# The daemon: the responder, and the ssh that carries the link, reconnected whenever it drops.
+link_daemon() {
+  local dir sock child='' resp='' idle=0 f
+  dir=$(link_dir_for "$host")
+  mkdir -p "$dir/users"
+  umask 077
+  echo $$ >"$dir/pid"
+  sock=$dir/link.sock
   link_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   link_port=$((20000 + RANDOM % 40000))
-  link_sock=$dir/link.sock
-  cleanup_dir=$dir
-  perl -e "$link_responder" "$link_sock" "$link_token" "$dir/clip.png" "$downloads" 2>/dev/null &
-  cleanup_pids+=($!)
-  # Disowned, so killing it at exit prints no job notice.
-  disown
-  for _ in $(seq 50); do
-    [[ -S $link_sock ]] && break
-    sleep 0.1
+  # shellcheck disable=SC2329 # run by the trap
+  stop() {
+    [[ -z $child ]] || kill "$child" 2>/dev/null
+    [[ -z $resp ]] || kill "$resp" 2>/dev/null
+    rm -f "$dir/pid" "$dir/port" "$sock" "$dir/clip.png"
+  }
+  trap stop EXIT
+  trap 'exit 0' INT TERM
+  trap '' HUP
+  while :; do
+    if [[ -z $resp ]] || ! kill -0 "$resp" 2>/dev/null; then
+      rm -f "$sock"
+      perl -e "$link_responder" "$sock" "$link_token" "$dir/clip.png" \
+        "$HOME/Downloads/rclaude/${host//[^A-Za-z0-9_.-]/_}" 2>/dev/null &
+      resp=$!
+      for _ in $(seq 50); do
+        [[ -S $sock ]] && break
+        sleep 0.1
+      done
+      echo "$link_port" >"$dir/port"
+    fi
+    if [[ -z $child ]] || ! kill -0 "$child" 2>/dev/null; then
+      # -tt: a terminal on the host, so the sleep is hung up when this connection ends.
+      ssh -o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=30 -o BatchMode=yes \
+        -tt -o ExitOnForwardFailure=yes -R "127.0.0.1:$link_port:$sock" "$host" \
+        "$(link_record) && exec sleep 2147483647" </dev/null >/dev/null 2>&1 &
+      child=$!
+    fi
+    sleep 5
+    for f in "$dir"/users/*; do
+      [[ -e $f ]] || continue
+      kill -0 "${f##*/}" 2>/dev/null || rm -f "$f"
+    done
+    if compgen -G "$dir/users/*" >/dev/null; then
+      idle=0
+    elif ((idle += 5)) && ((idle >= 60)); then
+      exit 0
+    fi
   done
 }
 
 # For the host's shell, before anything else: links xclip, osascript, open and xdg-open to
-# remote-claude (xclip is how Claude Code reads the clipboard on Linux, osascript on macOS), and
-# records this connection as ~/.rclaude-links/<port>, holding its token. One file per connection,
-# so several panes each keep theirs and one ending breaks no other; the host's side tries the
-# newest first, which is how a Claude Code started in an earlier connection finds a later one.
-link_setup() {
-  local setup
-  setup=$(link_install)
-  [[ -z $link_port ]] || setup+=" && $(link_record)"
-  printf '%s' "$setup"
-}
+# remote-claude (xclip is how Claude Code reads the clipboard on Linux, osascript on macOS). The
+# link's connection records itself as ~/.rclaude-links/<port>, holding its token; the host's side
+# tries the newest first and moves on from one that has ended.
 link_install() {
   # shellcheck disable=SC2016 # for the host's shell to expand
   printf '%s' 'mkdir -p ~/.local/share/rclaude/bin && for n in xclip osascript open xdg-open; do ln -sfn '"$server"' ~/.local/share/rclaude/bin/$n; done'
@@ -276,13 +339,11 @@ link_record() {
 link_path='PATH="$HOME/.local/share/rclaude/bin:$PATH"; export PATH'
 
 # Claude Code on the host, in tmux. Over mosh when both ends have it: mosh echoes keystrokes
-# locally and survives sleep and network changes, which ssh does neither of. mosh carries only the
-# terminal, so the link then rides its own ssh, reconnected in a loop for as long as this runs:
-# after a sleep mosh resumes by itself, and the loop brings the link back. Otherwise one ssh
-# connection carries both.
+# locally and survives sleep and network changes, which ssh does neither of. The link is the
+# host's shared one, on its own connection either way.
 run_on_host() {
   local inner script remote a status mosh_ready=
-  start_link
+  use_link
   [[ -n $link_port ]] || echo "rclaude: pasting and opening on this machine need macOS; continuing without them" >&2
   inner="$link_path; "
   if [[ -n $command ]]; then
@@ -309,25 +370,6 @@ run_on_host() {
   fi
 
   if [[ -n $mosh_ready ]]; then
-    if [[ -n $link_port ]]; then
-      # The loop passes its stop on to the ssh it is waiting for, which would otherwise outlive it.
-      (
-        child=
-        trap '[[ -z $child ]] || kill "$child" 2>/dev/null; exit 0' TERM
-        while :; do
-          # -tt: a terminal on the host, so the sleep is hung up when this connection ends.
-          "${ssh[@]}" -tt -o ExitOnForwardFailure=yes -R "127.0.0.1:$link_port:$link_sock" "$host" \
-            "$(link_record) && exec sleep 2147483647" </dev/null >/dev/null 2>&1 &
-          child=$!
-          # A dropped connection is ssh failing, and set -e would end the loop on it, for good:
-          # one reboot of the host once left every open pane without a link.
-          wait "$child" || true
-          sleep 5
-        done
-      ) &
-      cleanup_pids+=($!)
-      disown
-    fi
     # A login shell, so PATH has whatever the user's profile adds, such as where claude is
     # installed. mosh-server needs a UTF-8 locale the host has, and C.UTF-8 is the one every
     # Linux has; it would otherwise take this machine's, which the host may lack.
@@ -340,13 +382,17 @@ run_on_host() {
   fi
 
   # shellcheck disable=SC2016 # for the host's shell to expand
-  remote='exec "${SHELL:-/bin/sh}" -lc '"$(shell_quote "$(link_setup) && $script")"
+  remote='exec "${SHELL:-/bin/sh}" -lc '"$(shell_quote "$(link_install) && $script")"
   ssh+=(-t)
-  [[ -z $link_port ]] || ssh+=(-o ExitOnForwardFailure=yes -R "127.0.0.1:$link_port:$link_sock")
   status=0
   "${ssh[@]}" "$host" "$remote" || status=$?
   return $status
 }
+
+if [[ -n $daemon ]]; then
+  link_daemon
+  exit 0
+fi
 
 if [[ -n $on_host ]]; then
   session=${session:-$(basename "${cwd:-claude}")}
@@ -359,9 +405,9 @@ fi
 name=${name:-$host}
 name=${name//[^A-Za-z0-9_-]/_}
 
-# The link rides the MCP server's connection, so `open` in the remote bash reaches this machine.
-start_link
-remote="$(link_setup) && $link_path && exec $server serve"
+# The host's shared link, so `open` in the remote bash reaches this machine.
+use_link
+remote="$(link_install) && $link_path && exec $server serve"
 for root in ${roots[@]+"${roots[@]}"}; do
   remote+=" --root $(remote_quote "$root")"
 done
@@ -370,10 +416,8 @@ if [[ -n $cwd ]]; then
   remote+=" --cwd $(remote_quote "$cwd")"
 fi
 
-mcp_ssh=("${ssh_opts[@]}")
-[[ -z $link_port ]] || mcp_ssh+=(-R "127.0.0.1:$link_port:$link_sock")
 ssh_json=
-for a in "${mcp_ssh[@]}" "$host" "$remote"; do
+for a in "${ssh_opts[@]}" "$host" "$remote"; do
   ssh_json+=${ssh_json:+, }$(json_string "$a")
 done
 mcp_config="{\"mcpServers\": {$(json_string "$name"): {\"type\": \"stdio\", \"command\": \"ssh\", \"args\": [$ssh_json]}}}"
@@ -389,7 +433,6 @@ monitor_note=
 # Monitor runs its command in a local shell. With jq here to read the hook's input, a hook moves
 # the command to the host; the `|| exit 2` refuses the monitor even if this script cannot run.
 if command -v jq >/dev/null; then
-  self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
   hook="$(shell_quote "$self") --monitor-hook $(shell_quote "$host") $(shell_quote "$cwd") || exit 2"
   hooks=", \"hooks\": {\"PreToolUse\": [{\"matcher\": \"Monitor\", \"hooks\": [{\"type\": \"command\", \"command\": $(json_string "$hook")}]}]}"
   monitor_note=" Monitor commands run on \`$host\` too, in that directory."
